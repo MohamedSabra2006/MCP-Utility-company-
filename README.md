@@ -38,18 +38,31 @@ The LLM never has raw database access. Every state-changing action (such as mete
 
 ---
 
-## 📂 Project Structure
+## 🏗️ Repository Structure
 
 ```text
-MCP_final/
-├── agent_client.py         # MCP Client / Agent implementation with capability checks
-├── main_pipeline.py        # End-to-end operational execution pipeline & demo
-├── defensive_schemas1.py   # Pydantic models & strict JSON Schema validation
-├── mcp_tools1.py           # Core MCP state-changing & read-only tools
-├── mcp_prompts.py          # Server-side standardized prompt templates
-├── mcp_resources.py        # Read-only policy resources (EgyptERA Law 87/2015)
-├── sampling_handler.py     # Server-initiated sampling via client LLM
-└── security1.py            # Defensive checks, role authorization, and audit logs
+your-repo/
+├── README.md
+├── .gitignore
+├── .env                       # Environment variables (DB credentials, API keys)
+│
+├── db/                        # Database schemas and seed data
+│   ├── schema.sql             # DB Schema definitions
+│   ├── seed_data.sql          # Test accounts & mock utility data
+│   └── erd.png                # Entity Relationship Diagram
+│
+├── mcp_server/                # Core MCP Server & Defensive Middleware
+│   ├── tools.py               # Single-purpose MCP database execution tools
+│   ├── defensive_schemas.py   # Strict Pydantic/JSON schemas (additionalProperties: false)
+│   ├── security.py            # Policy Interceptor (Law 87/2015 validation layer)
+│   ├── resources.py           # Read-only utility data endpoints
+│   ├── prompts.py             # System prompt definitions & guardrails
+│   └── sampling.py          # LLM sampling & elicitation handlers
+│
+└── agent/                     # Client execution & orchestration pipeline
+    ├── agent_client.py        # MCP client connection handler
+    └── main_pipeline.py       # End-to-end execution entry point
+    
 🌐 MCP Protocol Concerns & Implementation Mapping
 This project implements all 8 mandatory MCP protocol concerns as required by the specification:
 1. Capability Negotiation:During handshakes, the client verifies if the server supports required capabilities (e.g., elicitation, sampling) before invoking risky write operations located agent_client.py
