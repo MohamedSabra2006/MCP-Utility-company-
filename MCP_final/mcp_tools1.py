@@ -16,12 +16,14 @@ import logging
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
+from mcp import types as mcp_types
 
 # Local Modular Imports
 from defensive_schemas1 import validate_defensive_input
 from security1 import verify_user_authorization
 from mcp_resources import MCPResourceManager
 from mcp_prompts import MCPPromptManager
+from sampling_handler2 import SYSTEM_PROMPT, build_sampling_messages, parse_medical_analysis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("NCEDC_Server")
@@ -130,6 +132,93 @@ async def audit_meter_status(meter_id: str) -> str:
         )
     except Exception as e:
         return f"❌ DB Error: {str(e)}"
+
+
+# =========================================================
+# SAMPLING PROTOCOL (sampling/createMessage) — shared helper
+# =========================================================
+async def _run_sampling_analysis(ctx: Context, meter_id: str, raw_note: str) -> dict:
+    """
+    Shared implementation: sends `raw_note` to the connected client's host LLM
+    via `sampling/createMessage` and returns a structured classification.
+    Used by both the standalone `analyze_inspector_note` tool and by
+    `execute_meter_disconnection` when a field note is supplied alongside
+    a disconnection request.
+
+    Fails closed: any error talking to the host model, or a response that
+    doesn't parse as the expected JSON, is treated as PARSE_ERROR — which
+    callers must treat as "cannot confirm the account is unprotected", not
+    as "safe to proceed".
+    """
+    if ctx is None:
+        return {
+            "status": "error",
+            "reason": (
+                "No MCP request context available — this tool must run inside "
+                "a live client connection that supports sampling/createMessage."
+            ),
+        }
+
+    messages_payload = build_sampling_messages(raw_note)
+    sampling_messages = [
+        mcp_types.SamplingMessage(
+            role=m["role"],
+            content=mcp_types.TextContent(type="text", text=m["content"]["text"]),
+        )
+        for m in messages_payload
+    ]
+
+    try:
+        result: mcp_types.CreateMessageResult = await ctx.session.create_message(
+            messages=sampling_messages,
+            system_prompt=SYSTEM_PROMPT,
+            max_tokens=400,
+            temperature=0.0,
+            # A hint, not a hard requirement — the client's host decides which
+            # model actually serves the request.
+            model_preferences=mcp_types.ModelPreferences(
+                hints=[mcp_types.ModelHint(name="gemini-2.5-flash")],
+                intelligencePriority=0.8,
+                speedPriority=0.5,
+            ),
+        )
+    except Exception as sampling_err:
+        logger.error(f"sampling/createMessage failed: {sampling_err}")
+        return {"status": "error", "reason": f"Sampling request failed: {sampling_err}"}
+
+    raw_text = getattr(result.content, "text", "")
+    evaluation = parse_medical_analysis(raw_text)
+
+    logger.info(
+        f"Sampling result for meter '{meter_id}' from model '{result.model}': "
+        f"{evaluation.get('decision')}"
+    )
+
+    return {
+        "status": "success",
+        "meter_id": meter_id,
+        "model_used": result.model,
+        **evaluation,
+    }
+
+
+@app.tool()
+async def analyze_inspector_note(
+    meter_id: str,
+    raw_note: str,
+    ctx: Context = None,
+) -> dict:
+    """
+    Sends a field inspector's unstructured note (often dialectal Arabic) to the
+    connected client's host LLM via `sampling/createMessage`, and returns a
+    structured medical-exemption / risk classification.
+
+    This tool never calls an LLM API itself — it delegates the actual
+    reasoning to whichever model the connected client's host has configured,
+    per the MCP sampling protocol. If the client hasn't wired up sampling
+    support, this fails explicitly rather than guessing at a classification.
+    """
+    return await _run_sampling_analysis(ctx, meter_id, raw_note)
 
 
 # =========================================================
@@ -257,12 +346,17 @@ async def execute_meter_disconnection(
     meter_id: str, 
     reason: str,
     requested_by: str = "inspector_ahmed",
+    inspector_note: Optional[str] = None,
     ctx: Context = None,
     session_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Initiates or completes an electrical meter service disconnection for overdue bills.
-    Checks if the meter is protected (Medical/Hospital). If protected, pauses for Elicitation.
+    Checks if the meter is protected (Medical/Hospital) via the database flag, and —
+    when an inspector_note is supplied — also via a live sampling/createMessage
+    classification of that note. Either signal being positive (or the sampling call
+    failing to produce a clear result) triggers Elicitation; only a database "not
+    protected" AND a sampling "not protected" (or no note supplied) skip it.
     """
     if session_context is None:
         session_context = {"username": requested_by, "user_role": "DISPATCHER"}
@@ -295,15 +389,35 @@ async def execute_meter_disconnection(
             conn.close()
             return f"❌ ERROR: Meter '{meter_id}' does not exist in Utility_company database."
 
-        is_protected = bool(meter_row[0])
+        db_is_protected = bool(meter_row[0])
         district = meter_row[1]
         override_code = None
         elicitation_triggered = False
 
+        # SAMPLING: if the caller supplied a freeform inspector note, classify it
+        # via the connected client's host LLM before deciding whether to treat
+        # this meter as protected. This is what actually connects the sampling
+        # protocol's output to a state-changing decision, rather than running
+        # sampling and the disconnection check in parallel with no interaction.
+        sampling_result = None
+        sampling_flagged_protected = False
+        if inspector_note:
+            sampling_result = await _run_sampling_analysis(ctx, meter_id, inspector_note)
+            decision = sampling_result.get("decision")
+            # Fail safe: a sampling error or an unparseable host-LLM reply is
+            # treated as "cannot confirm this account is safe to disconnect",
+            # not as "no exemption found". Silence must never look like a green light.
+            sampling_flagged_protected = decision in (
+                "PROTECTED - DO NOT DISCONNECT",
+                "PARSE_ERROR - MANUAL REVIEW REQUIRED",
+            ) or sampling_result.get("status") == "error"
+
+        is_protected = db_is_protected or sampling_flagged_protected
+
         # ELICITATION PROTOCOL
         if is_protected:
             elicitation_triggered = True
-            
+
             cursor.execute("""
                 SELECT medical_condition FROM medical_exemptions 
                 WHERE meter_id = ? AND is_active = 1
@@ -311,8 +425,23 @@ async def execute_meter_disconnection(
             med_row = cursor.fetchone()
             med_info = med_row[0] if med_row else "Critical Public Infrastructure / Hospital"
 
+            note_line = ""
+            if sampling_result is not None:
+                if sampling_result.get("status") == "error":
+                    note_line = (
+                        f"\nInspector-note analysis could not be completed "
+                        f"({sampling_result.get('reason')}) — treating as unconfirmed, not safe."
+                    )
+                else:
+                    note_line = (
+                        f"\nInspector-note analysis ({sampling_result.get('model_used', 'host LLM')}): "
+                        f"{sampling_result.get('decision')} — {sampling_result.get('reasoning', '')}"
+                    )
+
+            db_flag_line = "Database flag" if db_is_protected else "No database flag"
             warning_prompt = (
-                f"🚨 PROTECTED ACCOUNT ALERT! Meter '{meter_id}' ({district}) is flagged for: [{med_info}].\n"
+                f"🚨 PROTECTED ACCOUNT ALERT! Meter '{meter_id}' ({district}).\n"
+                f"{db_flag_line}. Registered medical exemption on file: [{med_info}].{note_line}\n"
                 f"Disconnecting this account without medical authorization violates EgyptERA regulations.\n"
                 f"Please enter Supervisor Override Code to proceed (or type 'CANCEL'):"
             )
@@ -405,6 +534,30 @@ if __name__ == "__main__":
                 progress_token="test-token-777"
             )
             print(f"Status: {batch_res.get('status')} | Audited Count: {batch_res.get('total_audited')}")
+
+            print("\n5️⃣ TESTING SAMPLING WITHOUT A LIVE CLIENT (expected: explicit failure, not a guess):")
+            sampling_res = await analyze_inspector_note(
+                meter_id="NC-MTR-30012",
+                raw_note="Customer objects, says there is a dialysis patient in the apartment",
+            )
+            print(sampling_res)
+            # With a real client connected (not --test), ctx is populated and this
+            # call actually round-trips through sampling/createMessage to the host
+            # LLM. --test has no live session, so ctx is None by design and the
+            # tool must refuse rather than fabricate a classification.
+
+            print("\n6️⃣ TESTING DISCONNECTION WITH inspector_note, NO LIVE CLIENT:")
+            print("   (DB says not protected, but a note was supplied and sampling can't")
+            print("    run without ctx -> must still fail safe into Elicitation, not skip it)")
+            supervisor_session = {"username": "supervisor_omar", "user_role": "DISTRICT_SUPERVISOR"}
+            combined_res = await execute_meter_disconnection(
+                meter_id="NC-MTR-30012",
+                reason="90+ days overdue, no prior protection flag on record",
+                requested_by="inspector_ahmed",
+                inspector_note="Customer objects, says there is a dialysis patient in the apartment",
+                session_context=supervisor_session,
+            )
+            print(combined_res)
 
         asyncio.run(run_direct_test())
     else:
