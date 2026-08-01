@@ -23,7 +23,7 @@ from defensive_schemas1 import validate_defensive_input
 from security1 import verify_user_authorization
 from mcp_resources import MCPResourceManager
 from mcp_prompts import MCPPromptManager
-from sampling_handler2 import SYSTEM_PROMPT, build_sampling_messages, parse_medical_analysis
+from sampling_handler import SYSTEM_PROMPT, build_sampling_messages, parse_medical_analysis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("NCEDC_Server")
