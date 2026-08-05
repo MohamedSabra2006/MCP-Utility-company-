@@ -9,6 +9,7 @@ Integrates:
 6. Defensive Schema Validation + Server-Side Auth
 7. Sampling / Model Reasoning Protocol
 """
+import os
 import sys
 import asyncio
 import pyodbc
@@ -19,8 +20,8 @@ from mcp.server.fastmcp import FastMCP, Context
 from mcp import types as mcp_types
 
 # Local Modular Imports
-from defensive_schemas1 import validate_defensive_input
-from security1 import verify_user_authorization
+from defensive_schemas import validate_defensive_input
+from security import verify_user_authorization, ALLOWED_ROLES_FOR_WRITE
 from mcp_resources import MCPResourceManager
 from mcp_prompts import MCPPromptManager
 from sampling_handler import SYSTEM_PROMPT, build_sampling_messages, parse_medical_analysis
@@ -32,6 +33,45 @@ logger = logging.getLogger("NCEDC_Server")
 app = FastMCP("ncedc-utility-server")
 resource_manager = MCPResourceManager()
 prompt_manager = MCPPromptManager()
+
+# Secrets belong in .env, not source. Falls back to the demo value only so
+# local/dev runs still work; set NCEDC_SUPERVISOR_PASSCODE in production.
+NCEDC_SUPERVISOR_PASSCODE = os.getenv("NCEDC_SUPERVISOR_PASSCODE", "NCEDC-SECURE-2026")
+
+
+# =========================================================
+# SERVER-SIDE SESSION STATE (fixes session_context injection)
+# =========================================================
+# `user_role` must NEVER be a tool argument the calling model can set —
+# a model could otherwise just pass session_context={"user_role": "SYS_ADMIN"}
+# and skip verify_user_authorization() entirely. Instead, role/identity are
+# tracked here, keyed off the identity of the live transport session object
+# (`ctx.session`). A tool argument can name a role; it cannot forge a
+# `ctx.session` object, because the MCP framework — not the model — is what
+# hands a tool its `ctx`.
+_SESSION_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def _session_key(ctx: Optional["Context"]) -> Optional[int]:
+    if ctx is None or getattr(ctx, "session", None) is None:
+        return None
+    return id(ctx.session)
+
+
+def _get_session_state(ctx: Optional["Context"]) -> Dict[str, Any]:
+    """
+    Resolves server-side session state for the connected client.
+    Every new connection starts at the lowest privilege (AUDITOR,
+    read-only) until it goes through `elevate_user_session_role` — the
+    only code path allowed to raise `user_role`.
+    """
+    key = _session_key(ctx)
+    if key is None:
+        # No live client session behind this call -> never assume trust.
+        return {"username": "unknown", "user_role": "GUEST"}
+    if key not in _SESSION_STATE:
+        _SESSION_STATE[key] = {"username": "unknown", "user_role": "AUDITOR"}
+    return _SESSION_STATE[key]
 
 # Target Database Configuration
 DB_CONFIG = {
@@ -226,30 +266,38 @@ async def analyze_inspector_note(
 # =========================================================
 @app.tool()
 async def elevate_user_session_role(
+    username: str,
     new_role: str,
     supervisor_passcode: str,
     ctx: Context = None,
-    session_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
-    Elevates session permissions from AUDITOR to DISPATCHER or DISTRICT_SUPERVISOR.
-    Triggers 'notifications/tools/list_changed' to update tools dynamically.
+    Elevates the CALLING SESSION's own permissions from AUDITOR to DISPATCHER
+    or DISTRICT_SUPERVISOR, gated on a supervisor passcode. Triggers
+    'notifications/tools/list_changed' so the connected client sees write
+    tools appear without reconnecting.
+
+    Role state is written to server-side session storage keyed on the live
+    transport session (see `_get_session_state`) — a tool argument can never
+    set `user_role` directly, here or on any other tool.
     """
-    if supervisor_passcode != "NCEDC-SECURE-2026":
+    if supervisor_passcode != NCEDC_SUPERVISOR_PASSCODE:
         return "⛔ ELEVATION REJECTED: Invalid Supervisor Passcode."
 
-    if session_context is not None:
-        session_context["user_role"] = new_role.upper()
+    if new_role.upper() not in set(ALLOWED_ROLES_FOR_WRITE) | {"AUDITOR"}:
+        return f"⛔ ELEVATION REJECTED: '{new_role}' is not a recognized role."
 
-    if ctx:
-        await ctx.session.send_tool_list_changed()
-        notification_msg = "Pushed 'notifications/tools/list_changed' to client."
-    else:
-        notification_msg = "Simulated notification push (notifications/tools/list_changed)."
+    key = _session_key(ctx)
+    if key is None:
+        return "⛔ ELEVATION REJECTED: No live client session to elevate."
+
+    _SESSION_STATE[key] = {"username": username, "user_role": new_role.upper()}
+
+    await ctx.session.send_tool_list_changed()
 
     return (
-        f"🟢 ROLE ELEVATED: Session upgraded to '{new_role.upper()}'.\n"
-        f"📢 PROTOCOL EVENT: {notification_msg}\n"
+        f"🟢 ROLE ELEVATED: Session upgraded to '{new_role.upper()}' for '{username}'.\n"
+        f"📢 PROTOCOL EVENT: Pushed 'notifications/tools/list_changed' to client.\n"
         f"Write-level tools like 'execute_meter_disconnection' are now active."
     )
 
@@ -348,7 +396,6 @@ async def execute_meter_disconnection(
     requested_by: str = "inspector_ahmed",
     inspector_note: Optional[str] = None,
     ctx: Context = None,
-    session_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Initiates or completes an electrical meter service disconnection for overdue bills.
@@ -357,9 +404,12 @@ async def execute_meter_disconnection(
     classification of that note. Either signal being positive (or the sampling call
     failing to produce a clear result) triggers Elicitation; only a database "not
     protected" AND a sampling "not protected" (or no note supplied) skip it.
+
+    Authorization is resolved from server-side session state tied to the live
+    connection (`_get_session_state`), never from a caller-supplied argument —
+    the calling model cannot elevate its own privileges just by naming a role.
     """
-    if session_context is None:
-        session_context = {"username": requested_by, "user_role": "DISPATCHER"}
+    session_context = _get_session_state(ctx)
 
     arguments = {
         "meter_id": meter_id, 
@@ -396,9 +446,7 @@ async def execute_meter_disconnection(
 
         # SAMPLING: if the caller supplied a freeform inspector note, classify it
         # via the connected client's host LLM before deciding whether to treat
-        # this meter as protected. This is what actually connects the sampling
-        # protocol's output to a state-changing decision, rather than running
-        # sampling and the disconnection check in parallel with no interaction.
+        # this meter as protected.
         sampling_result = None
         sampling_flagged_protected = False
         if inspector_note:
@@ -500,33 +548,61 @@ async def execute_meter_disconnection(
 # =========================================================
 if __name__ == "__main__":
     if "--test" in sys.argv:
+        class _FakeSession:
+            """
+            Stand-in for a live transport session, used only by --test so the
+            same session-keyed authorization path (_get_session_state /
+            elevate_user_session_role) runs identically to a real connection,
+            without a real client attached. `id(self)` is what keys
+            _SESSION_STATE, exactly like a real ctx.session would.
+            """
+            async def send_tool_list_changed(self):
+                print("   (simulated transport) notifications/tools/list_changed pushed")
+
+        class _FakeContext:
+            def __init__(self):
+                self.session = _FakeSession()
+
         async def run_direct_test():
             print("=========================================================")
             print("   NCEDC UTILITY COMPANY INTEGRATION TEST (--test)")
             print("=========================================================")
-            
-            session = {"username": "inspector_ahmed", "user_role": "AUDITOR"}
-            
+
+            auditor_ctx = _FakeContext()
+
             print("\n1️⃣ TESTING AUDIT READ TOOL:")
             read_res = await audit_meter_status(meter_id="NC-MTR-30012")
             print(read_res)
 
-            print("\n2️⃣ TESTING AUTH BLOCK ON WRITE TOOL (Auditor Role):")
+            print("\n2️⃣ TESTING AUTH BLOCK ON WRITE TOOL (Auditor Role, default on new session):")
             auth_res = await execute_meter_disconnection(
                 meter_id="NC-MTR-20045",
                 reason="Overdue balance clearance",
                 requested_by="inspector_ahmed",
-                session_context=session
+                ctx=auditor_ctx,
             )
             print(auth_res)
 
-            print("\n3️⃣ TESTING ROLE ELEVATION:")
+            print("\n3️⃣ TESTING ROLE ELEVATION (same session as above):")
             elevate_res = await elevate_user_session_role(
+                username="inspector_ahmed",
                 new_role="DISPATCHER",
-                supervisor_passcode="NCEDC-SECURE-2026",
-                session_context=session
+                supervisor_passcode=NCEDC_SUPERVISOR_PASSCODE,
+                ctx=auditor_ctx,
             )
             print(elevate_res)
+
+            print("\n3️⃣b TESTING SPOOF ATTEMPT (a stray session_context kwarg should now be a TypeError, not a bypass):")
+            try:
+                await execute_meter_disconnection(
+                    meter_id="NC-MTR-20045",
+                    reason="Trying to smuggle in a fake role",
+                    requested_by="attacker",
+                    session_context={"username": "attacker", "user_role": "SYS_ADMIN"},  # type: ignore
+                )
+                print("   ❌ UNEXPECTED: call succeeded — injection path still open!")
+            except TypeError as e:
+                print(f"   ✅ EXPECTED: rejected at the signature level ({e})")
 
             print("\n4️⃣ TESTING BATCH AUDIT (Utility_company DB):")
             batch_res = await batch_audit_delinquent_accounts(
@@ -541,27 +617,28 @@ if __name__ == "__main__":
                 raw_note="Customer objects, says there is a dialysis patient in the apartment",
             )
             print(sampling_res)
-            # With a real client connected (not --test), ctx is populated and this
-            # call actually round-trips through sampling/createMessage to the host
-            # LLM. --test has no live session, so ctx is None by design and the
-            # tool must refuse rather than fabricate a classification.
 
-            print("\n6️⃣ TESTING DISCONNECTION WITH inspector_note, NO LIVE CLIENT:")
+            print("\n6️⃣ TESTING DISCONNECTION WITH inspector_note, ON A FAKE (non-real-client) SESSION:")
             print("   (DB says not protected, but a note was supplied and sampling can't")
-            print("    run without ctx -> must still fail safe into Elicitation, not skip it)")
-            supervisor_session = {"username": "supervisor_omar", "user_role": "DISTRICT_SUPERVISOR"}
+            print("    run without a real ctx.session -> must still fail safe into Elicitation, not skip it)")
+            supervisor_ctx = _FakeContext()
+            await elevate_user_session_role(
+                username="supervisor_omar",
+                new_role="DISTRICT_SUPERVISOR",
+                supervisor_passcode=NCEDC_SUPERVISOR_PASSCODE,
+                ctx=supervisor_ctx,
+            )
             combined_res = await execute_meter_disconnection(
                 meter_id="NC-MTR-30012",
                 reason="90+ days overdue, no prior protection flag on record",
                 requested_by="inspector_ahmed",
                 inspector_note="Customer objects, says there is a dialysis patient in the apartment",
-                session_context=supervisor_session,
+                ctx=supervisor_ctx,
             )
             print(combined_res)
 
         asyncio.run(run_direct_test())
     else:
-        # Prevents thread exit by hosting persistent uvicorn server
         import uvicorn
-        print("\n🌐 NCEDC FastMCP Server listening continuously on http://127.0.0.1:8000/sse")
-        uvicorn.run(app.sse_app(), host="127.0.0.1", port=8000)
+        print("\n🌐 NCEDC FastMCP Server listening continuously (Streamable HTTP) on http://127.0.0.1:8000/mcp")
+        uvicorn.run(app.streamable_http_app(), host="127.0.0.1", port=8000)
